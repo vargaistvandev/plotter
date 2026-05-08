@@ -4,82 +4,232 @@
 #include <ArduinoMDNS.h>
 #include "secrets.h"
 
-// ---- WiFi ----
-//char ssid[] = "SSID";
-//char pass[] = "PASSWORD";
-WiFiServer server(80);
+// ---------------- WiFi ----------------
+WiFiServer server(80);          // web page
+WiFiServer controlServer(5000); // raw TCP control
 
-// ---- mDNS ----
+// ---------------- mDNS ----------------
 WiFiUDP udp;
 MDNS mdns(udp);
 
-// ---- Logging ----
-String logBuffer = "";
-
-void logMsg(String msg) {
-  logBuffer += msg + "\n";
-
-  // prevent memory blowup
-  if (logBuffer.length() > 2000) {
-    logBuffer = logBuffer.substring(logBuffer.length() - 1500);
-  }
-}
-
-// ---- Pen ----
+// ---------------- Pen ----------------
 #define PEN_DOWN 150
 #define PEN_UP   90
 
-#define STEP_DURATION 80
-#define STEP_SETTLE   50
+void moveToTarget(long targetX, long targetY) {
+
+  const int speed = 30;
+  const long tolerance = 60;
+
+  while (true) {
+
+    long currentX = readMotor1Count();
+    long currentY = readMotor2Count();
+
+    long errorX = targetX - currentX;
+    long errorY = targetY - currentY;
+
+    bool doneX = labs(errorX) <= tolerance;
+    bool doneY = labs(errorY) <= tolerance;
+
+    // ---- Motor X ----
+    if (!doneX) {
+      if (errorX > 0) {
+        M1.setDuty(speed);
+      } else {
+        M1.setDuty(-speed);
+      }
+    } else {
+      M1.setDuty(0);
+    }
+
+    // ---- Motor Y ----
+    if (!doneY) {
+      if (errorY > 0) {
+        M2.setDuty(speed);
+      } else {
+        M2.setDuty(-speed);
+      }
+    } else {
+      M2.setDuty(0);
+    }
+
+    // ---- Finished? ----
+    if (doneX && doneY) {
+      break;
+    }
+
+    delay(10);
+
+    // keep controller alive
+    controller.ping();
+    mdns.run();
+  }
+
+  // safety stop
+  M1.setDuty(0);
+  M2.setDuty(0);
+}
 
 void touchBlackPen() {
   servo3.setAngle(PEN_DOWN);
-  logMsg("Pen DOWN");
 }
 
 void liftPen() {
   servo3.setAngle(PEN_UP);
-  logMsg("Pen UP");
 }
 
-// ---- Step ----
-void stepMotor(int motor, int speed, int durationMs) {
-  speed = constrain(speed, -100, 100);
-
-  if (motor == 1) M1.setDuty(speed);
-  if (motor == 2) M2.setDuty(speed);
-
-  delay(durationMs);
-
-  M1.setDuty(0);
-  M2.setDuty(0);
-
-  delay(STEP_SETTLE);
+// ---------------- Helpers ----------------
+float readBatteryVoltage() {
+  return battery.getConverted();
 }
 
-// ---- HTML page ----
+int batteryPercentFromVoltage(float v) {
+  // Simple estimate. Adjust these values for your battery pack.
+  const float FULL_V  = 12.6;
+  const float EMPTY_V = 9.0;
+
+  float pct = (v - EMPTY_V) * 100.0 / (FULL_V - EMPTY_V);
+  if (pct < 0) pct = 0;
+  if (pct > 100) pct = 100;
+  return (int)(pct + 0.5);
+}
+
+long readMotor1Count() {
+  return encoder1.getRawCount();   // change if your library uses a different name
+}
+
+long readMotor2Count() {
+  return encoder2.getRawCount();   // change if your library uses a different name
+}
+
+String makeStatusJSON() {
+  float v = readBatteryVoltage();
+  int pct = batteryPercentFromVoltage(v);
+
+  String json = "{";
+  json += "\"batteryVoltage\":" + String(v, 2) + ",";
+  json += "\"motor1\":" + String(readMotor1Count()) + ",";
+  json += "\"batteryPercent\":" + String(pct) + ",";
+  json += "\"motor2\":" + String(readMotor2Count()) + ",";
+  json += "\"lowBattery\":" + String(v < 11.0 ? "true" : "false");
+  json += "}";
+  return json;
+}
+
 String makeHTML() {
+  float v = readBatteryVoltage();
+  int pct = batteryPercentFromVoltage(v);
+  long c1 = readMotor1Count();
+  long c2 = readMotor2Count();
+  bool low = (v < 11.0);
+
   String html = "<!DOCTYPE html><html><head><meta charset='utf-8'>";
-  html += "<title>Plotter</title>";
-  html += "<style>body{font-family:monospace;background:#111;color:#0f0;}</style>";
-  html += "</head><body>";
-  html += "<h2>Plotter Log</h2>";
-  html += "<pre>" + logBuffer + "</pre>";
-  html += "</body></html>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<meta http-equiv='refresh' content='1'>";
+  html += "<title>Plotter Status</title>";
+  html += "<style>";
+  html += "body{font-family:monospace;background:#111;color:#0f0;margin:0;padding:20px;}";
+  html += ".card{max-width:520px;border:1px solid #0f0;padding:16px;border-radius:10px;}";
+  html += ".row{display:flex;justify-content:space-between;gap:12px;padding:8px 0;border-bottom:1px solid #033;}";
+  html += ".row:last-child{border-bottom:none;}";
+  html += ".label{opacity:.8;}";
+  html += ".value{font-weight:bold;}";
+  html += ".warn{color:#ff8080;}";
+  html += "</style></head><body>";
+  html += "<div class='card'>";
+  html += "<h2>Plotter Status</h2>";
+  html += "<div class='row'><span class='label'>Battery</span><span class='value'>";
+  html += String(pct) + "%</span></div>";
+  html += "<div class='row'><span class='label'>Voltage</span><span class='value'>";
+  html += String(v, 2) + " V</span></div>";
+  html += "<div class='row'><span class='label'>Motor 1 counter</span><span class='value'>";
+  html += String(c1) + "</span></div>";
+  html += "<div class='row'><span class='label'>Motor 2 counter</span><span class='value'>";
+  html += String(c2) + "</span></div>";
+  html += "<div class='row'><span class='label'>Status</span><span class='value ";
+  html += (low ? "warn" : "") + String("'>");
+  html += (low ? "LOW BATTERY" : "OK");
+  html += "</span></div>";
+  html += "</div></body></html>";
+
   return html;
 }
 
-// ---- Setup ----
-void setup() {
+// ---------------- TCP control ----------------
+void handleTcpCommand(String cmd, WiFiClient &client) {
 
+  cmd.trim();
+
+  // ---- Check shared secret ----
+  int firstSpace = cmd.indexOf(' ');
+
+  if (firstSpace == -1) {
+    client.println("AUTH ERR");
+    return;
+  }
+
+  String secret = cmd.substring(0, firstSpace);
+  String actualCmd = cmd.substring(firstSpace + 1);
+
+  if (secret != SHARED_SECRET) {
+    client.println("AUTH ERR");
+    return;
+  }
+
+  actualCmd.trim();
+  actualCmd.toUpperCase();
+
+  // ---- Commands ----
+if (actualCmd.startsWith("MOVE ")) {
+
+  int split = actualCmd.indexOf(' ', 5);
+
+  if (split == -1) {
+    client.println("ERR");
+    return;
+  }
+
+  long targetX = actualCmd.substring(5, split).toInt();
+  long targetY = actualCmd.substring(split + 1).toInt();
+
+  moveToTarget(targetX, targetY);
+
+  client.println("OK");
+} else if (actualCmd == "PEN DOWN") {
+  touchBlackPen();
+  client.println("OK");
+} else if (actualCmd == "PEN UP") {
+  liftPen();
+  client.println("OK");
+} 
+
+
+else if (actualCmd == "STOP") {
+  M1.setDuty(0);
+  M2.setDuty(0);
+  client.println("OK");
+}
+
+else if (actualCmd == "STATUS") {
+  client.print(makeStatusJSON());
+}
+
+else {
+  client.println("ERR");
+}
+
+}
+
+// ---------------- Setup ----------------
+void setup() {
   if (!controller.begin()) {
-    while (1); // no serial fallback anymore
+    while (1) { }
   }
 
   controller.reboot();
   delay(500);
 
-  // ---- WiFi connect (with timeout!) ----
   unsigned long start = millis();
   bool wifiConnected = false;
 
@@ -92,124 +242,63 @@ void setup() {
   }
 
   if (wifiConnected) {
-    logMsg("WiFi connected");
-    uint32_t ip = WiFi.localIP();
-
-String ipStr = String((ip >> 24) & 0xFF) + "." +
-               String((ip >> 16) & 0xFF) + "." +
-               String((ip >> 8) & 0xFF) + "." +
-               String(ip & 0xFF);
-
-logMsg("IP: " + ipStr);
-
     if (mdns.begin(WiFi.localIP())) {
       mdns.setName("plotter");
-      logMsg("mDNS: plotter.local");
-    } else {
-      logMsg("mDNS failed");
     }
 
     server.begin();
-  } else {
-    logMsg("WiFi failed");
+    controlServer.begin();
   }
 }
 
-// ---- Loop ----
+// ---------------- Loop ----------------
 void loop() {
-
-  float batteryVoltage = battery.getConverted();
-
-  if (batteryVoltage < 11) {
-    logMsg("LOW BATTERY - STOP");
-    M1.setDuty(0);
-    M2.setDuty(0);
-    delay(500);
-    return;
+  // Raw TCP control port for Python
+  WiFiClient controlClient = controlServer.available();
+  if (controlClient) {
+    String cmd = controlClient.readStringUntil('\n');
+    handleTcpCommand(cmd, controlClient);
+    controlClient.stop();
   }
 
-  WiFiClient client = server.available();
+  // Web page
+  WiFiClient webClient = server.available();
+  if (webClient) {
+    String req = webClient.readStringUntil('\r');
+    webClient.flush();
 
-  if (client) {
-    String req = client.readStringUntil('\r');
-    client.flush();
-
-    logMsg(req);
-
-    handleRequest(req);
-
-    // ---- Serve HTML on root ----
-    if (req.indexOf("GET / ") != -1) {
-      client.println("HTTP/1.1 200 OK");
-      client.println("Content-Type: text/html");
-      client.println("Connection: close");
-      client.println();
-      client.println(makeHTML());
-    } else {
-      // API response
-      client.println("HTTP/1.1 200 OK");
-      client.println("Content-Type: text/plain");
-      client.println("Connection: close");
-      client.println();
-      client.println("OK");
+    if (req.indexOf("GET / ") != -1 || req.indexOf("GET /HTTP") != -1) {
+      webClient.println("HTTP/1.1 200 OK");
+      webClient.println("Content-Type: text/html");
+      webClient.println("Connection: close");
+      webClient.println();
+      webClient.println(makeHTML());
+    }
+    else if (req.indexOf("GET /status") != -1) {
+      webClient.println("HTTP/1.1 200 OK");
+      webClient.println("Content-Type: application/json");
+      webClient.println("Connection: close");
+      webClient.println();
+      webClient.println(makeStatusJSON());
+    }
+    else {
+      webClient.println("HTTP/1.1 200 OK");
+      webClient.println("Content-Type: text/plain");
+      webClient.println("Connection: close");
+      webClient.println();
+      webClient.println("OK");
     }
 
-    client.stop();
+    webClient.stop();
+  }
+
+  // Safety cutoff
+  float batteryVoltage = readBatteryVoltage();
+  if (batteryVoltage < 11.0) {
+    M1.setDuty(0);
+    M2.setDuty(0);
   }
 
   controller.ping();
   mdns.run();
-}
-
-// ---- Request handler ----
-void handleRequest(String req) {
-
-  if (req.indexOf("/x?") != -1) {
-    int speed = getParam(req, "speed");
-    M1.setDuty(constrain(speed, -100, 100));
-    logMsg("X speed " + String(speed));
-  }
-
-  else if (req.indexOf("/y?") != -1) {
-    int speed = getParam(req, "speed");
-    M2.setDuty(constrain(speed, -100, 100));
-    logMsg("Y speed " + String(speed));
-  }
-
-  else if (req.indexOf("/stepx?") != -1) {
-    int val = getParam(req, "val");
-    stepMotor(1, val, STEP_DURATION);
-    logMsg("Step X " + String(val));
-  }
-
-  else if (req.indexOf("/stepy?") != -1) {
-    int val = getParam(req, "val");
-    stepMotor(2, val, STEP_DURATION);
-    logMsg("Step Y " + String(val));
-  }
-
-  else if (req.indexOf("/stop") != -1) {
-    M1.setDuty(0);
-    M2.setDuty(0);
-    logMsg("STOP");
-  }
-
-  else if (req.indexOf("/down") != -1) {
-    touchBlackPen();
-  }
-
-  else if (req.indexOf("/up") != -1) {
-    liftPen();
-  }
-}
-
-// ---- Param parser ----
-int getParam(String req, String key) {
-  int start = req.indexOf(key + "=");
-  if (start == -1) return 0;
-
-  start += key.length() + 1;
-  int end = req.indexOf(' ', start);
-
-  return req.substring(start, end).toInt();
 }

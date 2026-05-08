@@ -1,16 +1,88 @@
-import requests
+import socket
+import json
 import time
 
-BASE = "http://plotter.local"   # or use IP if needed
+HOST = "plotter.local"
+PORT = 5000
 
-def send(cmd):
-    requests.get(f"{BASE}{cmd}", timeout=2)
+SECRET = "shared_secret_value"
 
-# ---- Sequence ----
-send("/down")          # pen down
-time.sleep(0.3)        # let servo settle
 
-send("/move?x=10&y=5") # small move
-time.sleep(1)          # wait until movement finishes
+def send(command: str) -> str:
 
-send("/up")            # pen up
+    full_command = f"{SECRET} {command}\n"
+
+    with socket.create_connection((HOST, PORT), timeout=5) as s:
+
+        s.sendall(full_command.encode("utf-8"))
+
+        chunks = []
+
+        while True:
+            data = s.recv(1024)
+
+            if not data:
+                break
+
+            chunks.append(data)
+
+        response = b"".join(chunks).decode("utf-8").strip()
+
+        print(">", command)
+        print("<", response)
+
+        return response
+
+
+def get_status():
+    """
+    Read JSON status from plotter.
+    """
+
+    response = send("STATUS")
+
+    try:
+        return json.loads(response)
+    except json.JSONDecodeError:
+        print("Invalid JSON!")
+        return None
+
+
+# ---------------- Demo ----------------
+
+print("Reading initial status...")
+status = get_status()
+
+if status:
+    print("Motor 1:", status["motor1"])
+    print("Motor 2:", status["motor2"])
+    print("Battery:", status["batteryPercent"], "%")
+
+print("\nPen down...")
+send("PEN DOWN")
+
+time.sleep(1)
+
+print("\nMove to 1000, 1000")
+send("MOVE 1000 1000")
+
+time.sleep(1)
+
+print("\nMove to 2000, 500")
+send("MOVE 2000 500")
+
+time.sleep(1)
+
+print("\nPen up...")
+send("PEN UP")
+
+time.sleep(1)
+
+print("\nStopping...")
+send("STOP")
+
+print("\nFinal status:")
+status = get_status()
+
+if status:
+    print(json.dumps(status, indent=2))
